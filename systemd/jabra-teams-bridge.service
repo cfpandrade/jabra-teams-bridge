@@ -1,0 +1,13 @@
+[Unit]
+Description=Puente de mute y gancho del headset Jabra hacia Teams
+After=pipewire.service wireplumber.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/jabra-teams-bridge
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

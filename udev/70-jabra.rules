@@ -1,0 +1,7 @@
+# Acceso de usuario a los hidraw de Jabra (GN Netcom), necesario para leer el
+# usage Telephony "Phone Mute" que el kernel no traduce a KEY_MICMUTE.
+#
+# uaccess concede acceso al usuario de la sesion activa mediante ACL. No uses
+# MODE="0666": dejaria el headset en lectura y escritura para cualquier proceso
+# local, que podria leer el flujo del microfono y manejar los LEDs.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b0e", MODE="0660", GROUP="plugdev", TAG+="uaccess"

@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""
+Puentea el mute y el gancho del headset Jabra a Teams.
+
+El headset corta el micro en firmware al mover el brazo, pero Teams no se
+entera: el dispositivo no expone KEY_MICMUTE (comprobado en
+/sys/class/input/inputN/capabilities/key: hay KEY_MUTE 113, volumenes y teclas
+de medios, pero no 248), asi que leemos el report HID crudo y mandamos la
+accion por el topic MQTT de teams-for-linux, que entrega el atajo con
+sendKeyboardEventToWindow y por tanto no depende del foco.
+
+Semantica del dispositivo (medida con timestamps de microsegundo, sep 2026):
+  Phone Mute (report 2, byte1 bit 3) es un PULSO de ~1 ms. El descriptor lo
+  declara relativo (0x81 0x07) y en captura el bit se pone a 1 y vuelve a 0
+  entre 0.9 y 6 ms despues, invariablemente. Queda descartado que sea un nivel.
+
+  Line (report 2, byte1 bit 2) en cambio es ABSOLUTO (0x81 0x23) y sigue el
+  estado off-hook. Es el bit que mueve el boton de llamada del casco.
+
+Por que fallaba el mute (corregido sep 2026):
+  Se creia que el brazo solo emitia al subirlo. No es asi. Segun el driver
+  hid-jabra del kernel, escrito por Jabra:
+
+    "key press events are only generated in the offhook state and only if the
+     mute state set by the host matches the mute state of the headset"
+    -- HID: jabra: Change mute LED state to avoid missing key press events
+
+  O sea: el casco se calla si el estado de mute que el host tiene puesto no
+  coincide con el suyo. Este daemon escribia el LED a pelo segun lo que dijera
+  Teams, y en cuanto eso se desalineaba el casco dejaba de reportar una de las
+  dos direcciones. El driver del kernel ya mantiene ese handshake por su
+  cuenta (expone /sys/class/leds/inputN::mute), asi que por defecto ya NO
+  escribimos el LED: JABRA_WRITE_LED=1 para volver al comportamiento viejo.
+
+Estado de mute de Teams:
+  Son dos topics distintos, no uno contaminado como se creia:
+    teams/microphone          derivado de audioLevel  -> off/silent/speaking
+    teams/microphone/control  estado real de mute     -> off/muted/unmuted
+  Usamos /control, que es el fiable. Verificado en llamada: se mantuvo en
+  unmuted mientras el brazo subia y bajaba con el daemon parado, y era cierto.
+
+Usamos toggle-mute y no mute/unmute porque un pulso significa "alterna", que
+es la traduccion exacta. Con el handshake vivo no se pierden eventos, asi que
+no hay fase que invertir. Si aun asi divergiera, RESYNC corrige con mute o
+unmute absolutos, que teams-for-linux acepta con guard de estado.
+
+Gancho: requiere el parche de tfl-patch-call-actions, que anade hangup,
+accept-audio, accept-video y decline al actionShortcutMap de teams-for-linux.
+Sin el parche esas acciones se rechazan por lista blanca y solo va el mute.
+
+Variables de entorno:
+  JABRA_MQTT_HOST / JABRA_MQTT_PORT / JABRA_TOPIC_PREFIX
+  JABRA_REQUIRE_CALL  0 -> manda el toggle tambien fuera de llamada
+  JABRA_WRITE_LED     1 -> vuelve a escribir el LED a pelo (rompe el handshake)
+  JABRA_HOOK          0 -> desactiva el puente del boton de llamada
+  JABRA_DEBUG         1 -> volca todos los reports con sus bits decodificados
+"""
+import glob
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
+
+HOST = os.environ.get("JABRA_MQTT_HOST", "localhost")
+PORT = os.environ.get("JABRA_MQTT_PORT", "1883")
+PREFIX = os.environ.get("JABRA_TOPIC_PREFIX", "teams")
+REQUIRE_CALL = os.environ.get("JABRA_REQUIRE_CALL", "1") != "0"
+WRITE_LED = os.environ.get("JABRA_WRITE_LED", "0") != "0"
+HOOK_ENABLED = os.environ.get("JABRA_HOOK", "1") != "0"
+DECLARE_STATE = os.environ.get("JABRA_DECLARE_STATE", "1") != "0"
+ALIGN_ON_CALL = os.environ.get("JABRA_ALIGN", "1") != "0"
+DEBUG = os.environ.get("JABRA_DEBUG", "0") != "0"
+
+CMD_TOPIC = f"{PREFIX}/command"
+MIC_TOPIC = f"{PREFIX}/microphone/control"
+CALL_TOPIC = f"{PREFIX}/in-call"
+RING_TOPIC = f"{PREFIX}/incoming-call"
+
+SIG = bytes([0x05, 0x0B, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x02])
+
+REPORT_ID = 2
+MUTE_MASK = 0x08      # byte1 bit 3 -> Phone Mute (0x2F), RELATIVO (pulso)
+HOOK_MASK = 0x01      # byte1 bit 0 -> Hook Switch (0x20), ABSOLUTO
+LINE_MASK = 0x04      # byte1 bit 2 -> Line (0x2A), ABSOLUTO (off-hook)
+# Report de SALIDA 2, pagina LED, 7 bits (decodificado del descriptor):
+#   bit0 0x01 usage 0x17 Off-Hook   bit1 0x02 0x1e   bit2 0x04 usage 0x09 Mute
+#   bit3 0x08 usage 0x18 Ring       bits 4-6 0x10/0x20/0x40
+OUT_OFFHOOK = 0x01
+OUT_MUTE    = 0x04
+OUT_RING    = 0x08
+LED_MUTE_MASK = OUT_MUTE  # nombre viejo, se mantiene por claridad
+
+BITS_B1 = ((0x01, "HOOK"), (0x02, "u0x97"), (0x04, "LINE"), (0x08, "MUTE"),
+           (0x10, "FLASH"), (0x20, "REDIAL"), (0x40, "u0x50"))
+BITS_B2 = ((0x08, "PROGBTN"),)
+
+# Si no recibe acuse, el headset reemite el pulso (se le vio reintentar cada
+# ~0.86s). Colapsamos todo lo que llegue en esta ventana en un solo toggle.
+DEBOUNCE = 1.2
+
+# Cuando Teams entra o sale de llamada, el casco sigue el cambio y mueve Line
+# el solo. Esa transicion es un eco del host, no una pulsacion, asi que
+# ignoramos los cambios de Line que caigan cerca de un cambio de in-call.
+ECHO_WINDOW = 2.0
+
+# Al arrancar, los topics retenidos de MQTT llegan de golpe y una llamada ya en
+# curso parece una llamada que acaba de empezar. Alinear ahi es incorrecto: a
+# media reunion la suposicion "Teams entra desmuteado" es falsa y el toggle de
+# alineacion invierte la polaridad. Solo alineamos si la transicion llega mas
+# tarde que esto desde el arranque.
+WARMUP = 5.0
+
+
+def find_mute_led():
+    """Nodo LED de mute que expone hid-jabra, para leer el estado de mute que
+    el kernel cree vigente. Es de root pero legible por todos."""
+    for path in glob.glob("/sys/class/leds/*::mute"):
+        try:
+            with open(f"{path}/device/name") as f:
+                if "jabra" in f.read().strip().lower():
+                    return f"{path}/brightness"
+        except OSError:
+            continue
+    return None
+
+
+def kernel_mute_bit(led):
+    """OUT_MUTE si el kernel cree que esta muteado, 0 si no o si no se sabe.
+
+    Nunca inventamos este bit: escribir un valor que no coincida con el que
+    tiene el casco es lo que rompe el handshake y silencia los eventos.
+    """
+    if not led:
+        return 0
+    try:
+        with open(led) as f:
+            return OUT_MUTE if f.read().strip() not in ("0", "") else 0
+    except OSError:
+        return 0
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def find_hidraw():
+    for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(f"{path}/device/uevent") as f:
+                if "0B0E" not in f.read().upper():
+                    continue
+            with open(f"{path}/device/report_descriptor", "rb") as f:
+                if SIG in f.read():
+                    return "/dev/" + os.path.basename(path)
+        except OSError:
+            continue
+    return None
+
+
+def send(action, **extra):
+    payload = {"action": action}
+    payload.update(extra)
+    subprocess.run(
+        ["mosquitto_pub", "-h", HOST, "-p", PORT, "-t", CMD_TOPIC,
+         "-m", json.dumps(payload), "-q", "1"],
+        check=False,
+    )
+
+
+def push_state(fd, mute_bit, offhook, ringing):
+    """Declara el estado de llamada al casco por el report de salida 2.
+
+    En HID Telephony el boton de gancho esta inerte hasta que el host declara
+    off-hook. Nadie lo hacia -- ni teams-for-linux, que no habla HID, ni este
+    daemon -- y por eso el boton de colgar no emitia un solo report: medido el
+    9-sep-2026, cero eventos HID al pulsarlo estando en llamada. El LINE que
+    se veia al entrar en llamada no era el boton, era el dongle detectando que
+    alguien abria su stream de audio.
+
+    El bit de mute arranca copiado del kernel y se VOLTEA tras cada pulso, que
+    es lo que hace hid-jabra con su LED. Si se deja estatico, solo una de las
+    dos direcciones del brazo encuentra host y casco de acuerdo, y la otra se
+    queda muda: medido el 9-sep-2026, con mute=False emitia al subir y con
+    mute=True al bajar. El sintoma original ("solo funciona al subir") era
+    exactamente eso, un estado del host estancado.
+    """
+    byte = 0
+    if offhook:
+        byte |= OUT_OFFHOOK
+    if ringing:
+        byte |= OUT_RING
+    byte |= mute_bit
+    try:
+        os.write(fd, bytes([REPORT_ID, byte, 0x00]))
+        log(f"  estado al casco: 0x{byte:02x} (offhook={bool(offhook)}"
+            f" ring={bool(ringing)} mute={bool(byte & OUT_MUTE)})")
+    except OSError as exc:
+        log(f"  no pude declarar el estado: {exc}")
+
+
+def run(dev):
+    fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
+    sub = subprocess.Popen(
+        ["mosquitto_sub", "-h", HOST, "-p", PORT, "-v",
+         "-t", MIC_TOPIC, "-t", CALL_TOPIC, "-t", RING_TOPIC],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    # Pipe en crudo: con un stream de texto, varias lineas en el mismo paquete
+    # quedan en el buffer de Python y select() ya no vuelve a avisar (los
+    # topics retenidos llegan juntos al conectar).
+    subfd = sub.stdout.fileno()
+    pending = b""
+    prev_mute = False
+    started = time.monotonic()
+    prev_hook = None          # None = aun no sabemos el estado de partida
+    prev_line = None
+    last_toggle = 0.0
+    last_call_change = 0.0
+    in_call = False
+    ringing = False
+    mic_state = "off"
+
+    led = find_mute_led()
+    host_mute = 0            # bit de mute que el casco cree que tiene el host
+    log(f"Escuchando {dev}")
+    log(f"  LED de mute del kernel: {led or 'no encontrado'}")
+    log(f"  mute -> toggle-mute en {CMD_TOPIC}")
+    log(f"  gancho {'activo' if HOOK_ENABLED else 'desactivado'}"
+        f"; LED a pelo {'SI' if WRITE_LED else 'no (lo gobierna hid-jabra)'}")
+    try:
+        while True:
+            ready, _, _ = select.select([fd, subfd], [], [], 1.0)
+
+            if subfd in ready:
+                chunk = os.read(subfd, 4096)
+                if not chunk:
+                    raise OSError("mosquitto_sub termino")
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    parts = line.decode(errors="replace").strip().split(None, 1)
+                    if len(parts) != 2:
+                        continue
+                    topic, value = parts
+                    if topic == CALL_TOPIC:
+                        new = value == "true"
+                        if new != in_call:
+                            last_call_change = time.monotonic()
+                        in_call = new
+                        log(f"  en llamada: {in_call}")
+                        if DECLARE_STATE:
+                            host_mute = kernel_mute_bit(led)
+                            push_state(fd, host_mute, in_call, ringing)
+                        # Alineacion de polaridad. Un pulso solo dice "el brazo
+                        # cambio", asi que tras N pulsos Teams queda en
+                        # inicial_teams XOR (N mod 2) y el brazo en
+                        # inicial_brazo XOR (N mod 2): coinciden solo si
+                        # coincidian al empezar. Damos por hecho que Teams
+                        # entra desmuteado -- no hay forma de leerlo, el topic
+                        # /control es ciego y siempre dice unmuted -- y si el
+                        # brazo esta arriba mandamos un toggle para cuadrarlo.
+                        # Si la suposicion falla, mover el brazo NO lo
+                        # arregla: cada pulso voltea el brazo y Teams a la vez,
+                        # asi que su desfase es invariante. Hay que voltear
+                        # Teams sin tocar el brazo, con un clic en su boton de
+                        # microfono. JABRA_ALIGN=0 desactiva la alineacion.
+                        if in_call and new and ALIGN_ON_CALL and host_mute:
+                            if time.monotonic() - started < WARMUP:
+                                log("  llamada ya en curso al arrancar:"
+                                    " no alineo (evita invertir la polaridad)")
+                            else:
+                                send("toggle-mute")
+                                last_toggle = time.monotonic()
+                                log("  brazo arriba al entrar:"
+                                    " alineo Teams a muted")
+                    elif topic == RING_TOPIC:
+                        ringing = value == "true"
+                        log(f"  llamada entrante: {ringing}")
+                        if DECLARE_STATE:
+                            push_state(fd, host_mute, in_call, ringing)
+                    elif topic == MIC_TOPIC:
+                        mic_state = value
+                        log(f"  Teams dice: {value}")
+                        if WRITE_LED:
+                            muted = value == "muted"
+                            try:
+                                os.write(fd, bytes(
+                                    [REPORT_ID,
+                                     LED_MUTE_MASK if muted else 0x00, 0x00]))
+                            except OSError as exc:
+                                log(f"  no pude escribir el LED: {exc}")
+
+            if fd in ready:
+                buf = os.read(fd, 64)
+                if not buf:
+                    continue
+                if DEBUG:
+                    names = []
+                    if buf[0] == REPORT_ID and len(buf) >= 3:
+                        names = [n for m, n in BITS_B1 if buf[1] & m]
+                        names += [n for m, n in BITS_B2 if buf[2] & m]
+                    log(f"  HID {buf.hex(' ')}  {','.join(names) or '-'}")
+                if buf[0] != REPORT_ID or len(buf) < 2:
+                    continue
+                now = time.monotonic()
+
+                mute_bit = bool(buf[1] & MUTE_MASK)
+                if mute_bit and not prev_mute:
+                    if now - last_toggle < DEBOUNCE:
+                        log("  pulso ignorado (reintento del headset)")
+                    elif REQUIRE_CALL and not in_call:
+                        log("  pulso ignorado (no hay llamada)")
+                    else:
+                        send("toggle-mute")
+                        last_toggle = now
+                        log(f"  pulso -> toggle-mute (Teams estaba {mic_state})")
+                        if DECLARE_STATE:
+                            # Volteamos para volver a coincidir con el casco,
+                            # o el movimiento siguiente no emitiria nada.
+                            host_mute = 0 if host_mute else OUT_MUTE
+                            push_state(fd, host_mute, in_call, ringing)
+                prev_mute = mute_bit
+
+                # Hook Switch es el bit del boton, pero solo esta vivo si el
+                # host ha declarado off-hook. Antes de hacerlo no se activaba
+                # nunca y habia que conformarse con Line, que en realidad
+                # seguia la apertura del stream de audio, no el boton.
+                hook_bit = bool(buf[1] & HOOK_MASK)
+                if prev_hook is None:
+                    prev_hook = hook_bit
+                elif hook_bit != prev_hook:
+                    prev_hook = hook_bit
+                    if not HOOK_ENABLED:
+                        pass
+                    elif now - last_call_change < ECHO_WINDOW:
+                        log("  Hook movido por el host, no por el boton")
+                    elif not hook_bit and in_call:
+                        send("hangup")
+                        log("  boton -> hangup")
+                    elif hook_bit and ringing:
+                        send("accept-audio")
+                        log("  boton -> accept-audio")
+                    else:
+                        log(f"  Hook={hook_bit} sin accion aplicable")
+
+                line_bit = bool(buf[1] & LINE_MASK)
+                if prev_line is None:
+                    prev_line = line_bit          # solo fijamos la referencia
+                elif line_bit != prev_line:
+                    prev_line = line_bit
+                    log(f"  Line={line_bit} (informativo; el boton va por Hook)")
+    finally:
+        sub.terminate()
+        os.close(fd)
+
+
+def main():
+    if not shutil.which("mosquitto_pub"):
+        log("Falta mosquitto_pub: instala mosquitto-clients")
+        return 1
+    while True:
+        dev = find_hidraw()
+        if dev is None:
+            log("Jabra no presente; reintento en 5s")
+            time.sleep(5)
+            continue
+        try:
+            run(dev)
+        except OSError as exc:
+            log(f"Perdido el dispositivo o el broker ({exc}); reintento en 3s")
+            time.sleep(3)
+        except KeyboardInterrupt:
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

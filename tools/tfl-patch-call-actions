@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Dos parches sobre teams-for-linux, ambos necesarios para que un headset
+# controle Teams desde un puente externo (MQTT):
+#
+# 1) actionShortcutMap: la lista blanca de acciones MQTT se deriva de ese mapa
+#    y solo trae mute/video/hand-raise. Anadimos hangup, accept-audio,
+#    accept-video y decline. handleMqttCommand manda por su rama else
+#    cualquier accion no-mute a handleShortcutCommand, asi que basta el mapa.
+#
+# 2) sendKeyboardEventToWindow: sendInputEvent entrega la tecla al renderer
+#    pero no concede foco, y Teams web ignora los atajos si el documento no
+#    esta enfocado. Resultado: los comandos MQTT solo funcionan con la ventana
+#    en primer plano, lo que anula su proposito. Medido el 9-sep-2026: con
+#    Teams enfocado el toggle-mute funciona, de fondo no. webContents.focus()
+#    da foco de entrada al contenido sin activar la ventana del sistema.
+#
+# Hay que reejecutarlo tras cada upgrade del paquete, que restaura el asar.
+# Idempotente: comprueba los dos parches por separado.
+set -euo pipefail
+
+ASAR=/opt/teams-for-linux/resources/app.asar
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+[[ -f $ASAR ]] || { echo "no encuentro $ASAR" >&2; exit 1; }
+
+need_actions=1; need_focus=1
+grep -aq "'hangup': 'Ctrl+Shift+H'"        "$ASAR" && need_actions=0
+grep -aq "TFL_PATCH_FOCUS"                 "$ASAR" && need_focus=0
+if (( need_actions == 0 && need_focus == 0 )); then
+  echo "ya parcheado (acciones + foco), nada que hacer"; exit 0
+fi
+echo "por aplicar: acciones=$need_actions foco=$need_focus"
+
+echo "== extrayendo =="
+npx --yes @electron/asar extract "$ASAR" "$WORK/app"
+
+if (( need_actions )); then
+  echo "== parche 1: acciones de llamada =="
+  python3 - "$WORK/app/app/mqtt/index.js" <<'PY'
+import io, sys
+p = sys.argv[1]
+src = io.open(p, encoding='utf-8').read()
+old = "\t\t\t'toggle-hand-raise': 'Ctrl+Shift+K'\n\t\t};"
+new = ("\t\t\t'toggle-hand-raise': 'Ctrl+Shift+K',\n"
+       "\t\t\t'hangup': 'Ctrl+Shift+H',\n"
+       "\t\t\t'accept-audio': 'Ctrl+Shift+S',\n"
+       "\t\t\t'accept-video': 'Ctrl+Shift+A',\n"
+       "\t\t\t'decline': 'Ctrl+Shift+D'\n\t\t};")
+if src.count(old) != 1:
+    sys.exit(f"esperaba 1 coincidencia del actionShortcutMap, encontre {src.count(old)}")
+io.open(p, 'w', encoding='utf-8').write(src.replace(old, new))
+print("  mapa ampliado")
+PY
+fi
+
+if (( need_focus )); then
+  echo "== parche 2: foco antes de inyectar la tecla =="
+  python3 - "$WORK/app/app/globalShortcuts/index.js" <<'PY'
+import io, sys
+p = sys.argv[1]
+src = io.open(p, encoding='utf-8').read()
+old = """    const parsed = parseAccelerator(accelerator);
+
+    window.webContents.sendInputEvent({
+      type: "keyDown","""
+new = """    const parsed = parseAccelerator(accelerator);
+
+    // TFL_PATCH_FOCUS: sendInputEvent entrega la tecla al renderer pero no
+    // concede foco, y Teams web solo despacha sus atajos si el documento esta
+    // enfocado. Sin esto los comandos MQTT solo funcionan con la ventana en
+    // primer plano. focus() sobre webContents da foco de entrada al contenido
+    // sin activar la ventana del sistema, asi que no le roba el foco al
+    // usuario.
+    try {
+      window.webContents.focus();
+    } catch (e) {
+      console.debug(`[GLOBAL_SHORTCUTS] focus() fallo: ${e.message}`);
+    }
+
+    window.webContents.sendInputEvent({
+      type: "keyDown","""
+if src.count(old) != 1:
+    sys.exit(f"esperaba 1 coincidencia de sendKeyboardEventToWindow, encontre {src.count(old)}")
+io.open(p, 'w', encoding='utf-8').write(src.replace(old, new))
+print("  focus() insertado")
+PY
+fi
+
+echo "== validando sintaxis =="
+node --check "$WORK/app/app/mqtt/index.js"
+node --check "$WORK/app/app/globalShortcuts/index.js"
+
+echo "== repaquetando =="
+# Replica la regla de electron-builder: los modulos nativos van fuera del asar.
+npx --yes @electron/asar pack "$WORK/app" "$WORK/app.asar.new" \
+  --unpack-dir "{**/cbor-extract,**/@cbor-extract/*}"
+
+echo "== verificando =="
+find /opt/teams-for-linux/resources/app.asar.unpacked -type f \
+  | sed 's|.*/app.asar.unpacked/||' | sort > "$WORK/unp-orig"
+find "$WORK/app.asar.new.unpacked" -type f \
+  | sed 's|.*\.unpacked/||' | sort > "$WORK/unp-new"
+diff -q "$WORK/unp-orig" "$WORK/unp-new" \
+  || { echo "la lista de ficheros unpacked no coincide, aborto" >&2; exit 1; }
+
+npx --yes @electron/asar list "$ASAR"              | sort > "$WORK/l-orig"
+npx --yes @electron/asar list "$WORK/app.asar.new" | sort > "$WORK/l-new"
+diff -q "$WORK/l-orig" "$WORK/l-new" \
+  || { echo "el listado interno no coincide, aborto" >&2; exit 1; }
+echo "  unpacked y listado interno identicos"
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+echo "== instalando (sudo) =="
+sudo cp "$ASAR" "$ASAR.orig-$STAMP"
+sudo cp "$WORK/app.asar.new" "$ASAR"
+sudo cp -r "$WORK/app.asar.new.unpacked/." /opt/teams-for-linux/resources/app.asar.unpacked/
+# /opt debe quedar en manos de root: cp -a habria propagado el dueno del tmpdir.
+sudo chown -R root:root /opt/teams-for-linux/resources/app.asar.unpacked
+sudo chmod -R go-w /opt/teams-for-linux/resources/app.asar.unpacked
+echo "hecho. copia de seguridad: $ASAR.orig-$STAMP"
+echo "reinicia teams-for-linux para que cargue el asar nuevo."

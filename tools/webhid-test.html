@@ -1,0 +1,61 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Prueba WebHID Jabra</title>
+<style>
+ body{font:14px system-ui;margin:2rem;max-width:60rem}
+ button{font:inherit;padding:.6rem 1rem;cursor:pointer}
+ pre{background:#111;color:#0f0;padding:1rem;overflow:auto;max-height:24rem}
+ .bad{color:#c00}.good{color:#080}
+</style>
+<h1>Prueba WebHID — Jabra (0x0b0e)</h1>
+<p>Pulsa el boton, elige el <b>Jabra Link 380</b> en el dialogo, y luego
+mueve el brazo y pulsa el boton de llamada del casco.</p>
+<button id="go">Pedir dispositivo HID</button>
+<button id="clear">Limpiar</button>
+<pre id="out">esperando...</pre>
+<script>
+const out = document.getElementById('out');
+const log = (m, cls) => {
+  const t = new Date().toISOString().substr(11, 12);
+  out.textContent += `\n[${t}] ${m}`;
+  out.scrollTop = out.scrollHeight;
+};
+document.getElementById('clear').onclick = () => out.textContent = '';
+
+if (!('hid' in navigator)) {
+  log('!! navigator.hid NO existe: este navegador no soporta WebHID');
+} else {
+  log('navigator.hid disponible; contexto seguro: ' + window.isSecureContext);
+}
+
+document.getElementById('go').onclick = async () => {
+  try {
+    const devs = await navigator.hid.requestDevice({
+      filters: [{ vendorId: 0x0b0e }]
+    });
+    if (!devs.length) {
+      log('!! lista vacia: o no elegiste nada, o el navegador no ofrecio el dispositivo');
+      return;
+    }
+    for (const d of devs) {
+      log(`concedido: "${d.productName}" vid=0x${d.vendorId.toString(16)} pid=0x${d.productId.toString(16)}`);
+      for (const c of d.collections) {
+        log(`  coleccion usagePage=0x${c.usagePage.toString(16)} usage=0x${c.usage.toString(16)}`);
+        for (const r of (c.inputReports || []))
+          log(`    inputReport id=${r.reportId}`);
+        for (const r of (c.outputReports || []))
+          log(`    outputReport id=${r.reportId}`);
+      }
+      if (!d.opened) await d.open();
+      log('  abierto; escuchando inputreport...');
+      d.addEventListener('inputreport', e => {
+        const b = new Uint8Array(e.data.buffer);
+        const hex = [...b].map(x => x.toString(16).padStart(2, '0')).join(' ');
+        log(`  IN id=${e.reportId}  ${hex}`);
+      });
+    }
+  } catch (err) {
+    log('!! error: ' + err.name + ': ' + err.message);
+  }
+};
+</script>
